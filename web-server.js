@@ -14,7 +14,7 @@ const path = require('path');
 const os = require('os');
 const fs = require('fs');
 
-const WEB_PORT = Number(process.env.WEB_PORT || 8080);
+const WEB_PORT = Number(process.env.WEB_PORT || process.env.PORT || 8080);
 const WEB_USER_DATA_DIR = path.resolve(
   process.env.WEB_USER_DATA_DIR ||
   path.join(os.homedir(), '.petvet-web'),
@@ -184,6 +184,12 @@ const store = new Store({ cwd: WEB_USER_DATA_DIR });
 // saasClient (handlers/authHandlers.js) fetches this baseUrl when proxying
 // API calls; point it at ourselves so every /api/* call stays same-origin.
 process.env.SAAS_API_BASE_URL = `http://localhost:${WEB_PORT}`;
+
+// On Render (or any single-process deploy) the same server proxies /api/* to
+// SAAS_API_BASE_URL — same-origin here, so it short-circuits to ourselves.
+if (process.env.SAAS_API_BASE_URL_OVERRIDE) {
+  process.env.SAAS_API_BASE_URL = process.env.SAAS_API_BASE_URL_OVERRIDE;
+}
 
 // The desktop build persists absolute `http://localhost:4000/...` URLs in
 // DB columns (e.g. clinic_settings.logo_url) and API data. Rewrite those so

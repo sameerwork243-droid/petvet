@@ -41,7 +41,12 @@ app.use((req, res, next) => {
 const clinicStore = new AsyncLocalStorage();
 let platConn = null;
 const clinicConns = new Map();
-const DB_OPTS = { host: 'localhost', user: 'root', password: '', multipleStatements: true };
+const DB_OPTS = {
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  multipleStatements: true,
+};
 
 function getClinicConn(clinicId) {
   clinicId = Number(clinicId) || 1;
