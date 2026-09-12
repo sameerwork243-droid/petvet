@@ -178,8 +178,34 @@ try { require('dotenv').config(); } catch (_) {}
 // ---------------------------------------------------------------------------
 const { app, startServer } = require('./server');
 
-const Store = require('electron-store').default;
-const store = new Store({ cwd: WEB_USER_DATA_DIR });
+// A tiny electron-store-compatible JSON store (get/set/delete) that works in
+// a bare Node process. The real electron-store hard-requires the `electron`
+// package, which is NOT installed on Render — so we persist config/session to
+// a file under WEB_USER_DATA_DIR instead. Handlers only ever use get/set/delete.
+class JsonStore {
+  constructor(file) {
+    this.file = file;
+    this.data = {};
+    try { this.data = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (_) {}
+  }
+  get(key, def) {
+    const has = Object.prototype.hasOwnProperty.call(this.data, key);
+    return has ? this.data[key] : def;
+  }
+  set(key, value) {
+    this.data[key] = value;
+    this._flush();
+  }
+  delete(key) {
+    delete this.data[key];
+    this._flush();
+  }
+  _flush() {
+    fs.mkdirSync(path.dirname(this.file), { recursive: true });
+    fs.writeFileSync(this.file, JSON.stringify(this.data, null, 2));
+  }
+}
+const store = new JsonStore(path.join(WEB_USER_DATA_DIR, 'web-store.json'));
 
 // saasClient (handlers/authHandlers.js) fetches this baseUrl when proxying
 // API calls; point it at ourselves so every /api/* call stays same-origin.
