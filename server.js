@@ -27,7 +27,7 @@ app.use('/uploaded', express.static(uploadsDir));
 // If MySQL isn't reachable yet (startup retry, or env vars missing), return a
 // readable 503 instead of crashing the process with `null.query`.
 app.use((req, res, next) => {
-  if (req.path.startsWith('/api/') && !platConn) {
+  if (req.path.startsWith('/api/') && !_plat) {
     return res.status(503).json({
       error: {
         message: 'Database is not connected yet. Check DB_HOST/DB_USER/DB_PASSWORD and the MySQL server.',
@@ -53,7 +53,8 @@ app.use((req, res, next) => {
 });
 
 const clinicStore = new AsyncLocalStorage();
-let platConn = null;
+let _plat = null;
+let _platPromise = null;
 const clinicConns = new Map();
 const DB_OPTS = {
   host: process.env.DB_HOST || 'localhost',
@@ -64,13 +65,77 @@ const DB_OPTS = {
   multipleStatements: true,
 };
 
+const CLOSED_RE = /closed state|ECONNRESET|EPIPE|socket hang up|Connection lost|PROTOCOL_CONNECTION_LOST|keepalive|handshake timeout/i;
+
+// Platform connection (`petvet`) with lazy connect + auto-reconnect. Hosted
+// MySQL (Aiven/Railway/...) closes idle connections; mysql2 doesn't heal a
+// dead single connection, so we replace it on the next call.
+async function ensurePlat() {
+  if (_plat) return _plat;
+  if (_platPromise) return _platPromise;
+  _platPromise = (async () => {
+    const conn = await mysql.createConnection({ ...DB_OPTS, database: 'petvet' });
+    _plat = conn;
+    try { await ensurePlatformSchema(); } catch (e) { console.error('ensurePlatformSchema failed:', e.message); }
+    console.log('Connected to MySQL');
+    return conn;
+  })().finally(() => { _platPromise = null; });
+  return _platPromise;
+}
+
+function openClinicConn(clinicId) {
+  const conn = mysql.createConnection({ ...DB_OPTS, database: `clinic_${clinicId}` });
+  conn.on('error', () => {});
+  return conn;
+}
+
+// Wrap a raw connection so a closed/stale one is transparently replaced and
+// the call retried once (hosted MySQL drops idle connections).
+function healConn(holder, open) {
+  return new Proxy({}, {
+    get(_t, prop) {
+      if (prop === 'then') return undefined;
+      return async (...args) => {
+        let conn = holder.c;
+        if (!conn) { holder.c = open(); conn = holder.c; }
+        try { return await conn[prop](...args); }
+        catch (e) {
+          if (!CLOSED_RE.test(String((e && e.message) || e))) throw e;
+          try { conn.destroy && conn.destroy(); } catch (_) {}
+          holder.c = open(); conn = holder.c;
+          return await conn[prop](...args);
+        }
+      };
+    },
+  });
+}
+
+const platConn = new Proxy({}, {
+  get(_t, prop) {
+    if (prop === 'then') return undefined; // not a thenable
+    return async (...args) => {
+      const conn = _plat || await ensurePlat();
+      try { return await conn[prop](...args); }
+      catch (e) {
+        if (!CLOSED_RE.test(String((e && e.message) || e))) throw e;
+        _plat = null;
+        const fresh = await ensurePlat();
+        return await fresh[prop](...args);
+      }
+    };
+  },
+});
+
 function getClinicConn(clinicId) {
   clinicId = Number(clinicId) || 1;
   if (clinicId === 1) return Promise.resolve(platConn);
-  if (!clinicConns.has(clinicId)) {
-    clinicConns.set(clinicId, mysql.createConnection({ ...DB_OPTS, database: `clinic_${clinicId}` }));
+  let entry = clinicConns.get(clinicId);
+  if (!entry) {
+    entry = { c: null, proxy: null };
+    entry.proxy = healConn(entry, () => openClinicConn(clinicId));
+    clinicConns.set(clinicId, entry);
   }
-  return clinicConns.get(clinicId);
+  return Promise.resolve(entry.proxy);
 }
 
 // `db` routes every query to the current request's clinic database (from the
@@ -120,9 +185,7 @@ async function createClinicDatabase(clinicId, clinicName) {
 }
 
 async function connectDB() {
-  platConn = await mysql.createConnection({ ...DB_OPTS, database: 'petvet' });
-  await ensurePlatformSchema();
-  console.log('Connected to MySQL');
+  await ensurePlat();
 }
 
 function authMiddleware(req, res, next) {
