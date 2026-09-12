@@ -3,6 +3,7 @@ const cors = require('cors');
 const mysql = require('mysql2/promise');
 const bcrypt = require('bcrypt');
 const path = require('path');
+const { AsyncLocalStorage } = require('async_hooks');
 
 const app = express();
 app.set('query parser', 'extended');
@@ -37,16 +38,69 @@ app.use((req, res, next) => {
   next();
 });
 
-let db;
+const clinicStore = new AsyncLocalStorage();
+let platConn = null;
+const clinicConns = new Map();
+const DB_OPTS = { host: 'localhost', user: 'root', password: '', multipleStatements: true };
+
+function getClinicConn(clinicId) {
+  clinicId = Number(clinicId) || 1;
+  if (clinicId === 1) return Promise.resolve(platConn);
+  if (!clinicConns.has(clinicId)) {
+    clinicConns.set(clinicId, mysql.createConnection({ ...DB_OPTS, database: `clinic_${clinicId}` }));
+  }
+  return clinicConns.get(clinicId);
+}
+
+// `db` routes every query to the current request's clinic database (from the
+// JWT set by authMiddleware). Whole-account tables (users / clinics) always
+// run against the platform DB (`petvet`) explicitly via platConn.
+const db = new Proxy({}, {
+  get(_t, prop) {
+    return (...args) => {
+      const clinicId = clinicStore.getStore();
+      return (clinicId ? getClinicConn(clinicId) : Promise.resolve(platConn)).then(c => c[prop](...args));
+    };
+  },
+});
+
+async function ensurePlatformSchema() {
+  await platConn.query(`CREATE TABLE IF NOT EXISTS clinics (
+    id INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    clinic_name VARCHAR(255) NOT NULL,
+    slug VARCHAR(100) DEFAULT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+  const [cols] = await platConn.query(`SELECT COUNT(*) AS n FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA='petvet' AND TABLE_NAME='users' AND COLUMN_NAME='clinic_id'`);
+  if (!cols[0].n) await platConn.query('ALTER TABLE users ADD COLUMN clinic_id INT DEFAULT 1');
+  const [cc] = await platConn.query('SELECT COUNT(*) AS n FROM clinics WHERE id=1');
+  if (!cc[0].n) await platConn.query('INSERT INTO clinics (id, clinic_name, slug) VALUES (1, "PetVet Clinic", "petvet")');
+  await platConn.query('UPDATE users SET clinic_id=1 WHERE clinic_id IS NULL');
+}
+
+async function createClinicDatabase(clinicId, clinicName) {
+  const admin = await mysql.createConnection({ ...DB_OPTS });
+  try {
+    await admin.query(`CREATE DATABASE IF NOT EXISTS \`clinic_${clinicId}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci`);
+    await admin.query(`USE \`clinic_${clinicId}\``);
+    await admin.query('SET FOREIGN_KEY_CHECKS=0');
+    const [tables] = await platConn.query('SHOW TABLES');
+    for (const t of tables) {
+      const name = Object.values(t)[0];
+      if (name === 'users' || name === 'clinics') continue;
+      const [[def]] = await platConn.query(`SHOW CREATE TABLE \`${name}\``);
+      await admin.query(def['Create Table']);
+    }
+    await admin.query('SET FOREIGN_KEY_CHECKS=1');
+    await admin.query('INSERT INTO clinic_settings (id, clinic_name, brand_color) VALUES (1, ?, "#93CAED")', [clinicName]);
+    await admin.query('INSERT INTO branches (branch_name, is_active) VALUES ("Main Branch", 1)');
+  } finally { await admin.end(); }
+}
 
 async function connectDB() {
-  db = await mysql.createConnection({
-    host: 'localhost',
-    user: 'root',
-    password: '',
-    database: 'petvet',
-    multipleStatements: true
-  });
+  platConn = await mysql.createConnection({ ...DB_OPTS, database: 'petvet' });
+  await ensurePlatformSchema();
   console.log('Connected to MySQL');
 }
 
@@ -58,26 +112,28 @@ function authMiddleware(req, res, next) {
     const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
     req.userId = payload.sub || payload.userId || 1;
     req.clinicId = payload.clinicId || 1;
-    next();
+    clinicStore.run(Number(req.clinicId), () => next());
   } catch { res.status(401).json({ error: 'Invalid token' }); }
 }
 
 function makeToken(userId, clinicId) {
   const header = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
-  const payload = Buffer.from(JSON.stringify({ sub: userId, clinicId, iat: Date.now(), exp: Date.now() + 86400000 })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ sub: userId, clinicId: Number(clinicId) || 1, iat: Date.now(), exp: Date.now() + 86400000 })).toString('base64url');
   const sig = Buffer.from('dummy').toString('base64url');
   return `${header}.${payload}.${sig}`;
 }
 
-async function okClinicSession(u) {
+async function okClinicSession(u, clinicId) {
+  const cid = Number(clinicId) || Number(u.clinic_id) || 1;
   let clinicName = 'PetVet Clinic';
   try {
-    const [rows] = await db.query('SELECT clinic_name FROM clinic_settings WHERE id=1');
+    const conn = await getClinicConn(cid);
+    const [rows] = await conn.query('SELECT clinic_name FROM clinic_settings WHERE id=1');
     if (rows.length && rows[0].clinic_name) clinicName = rows[0].clinic_name;
   } catch (_) {}
   return {
     user: { id: u.id, name: u.name, username: u.username, email: u.email, isPlatformAdmin: u.role === 'OWNER' },
-    activeClinic: { clinicId: 1, clinicName, slug: 'petvet', role: u.role || 'OWNER', branchId: null, accessBlocked: null },
+    activeClinic: { clinicId: cid, clinicName, slug: 'petvet', role: u.role || 'OWNER', branchId: null, accessBlocked: null },
   };
 }
 
@@ -189,13 +245,13 @@ async function unpaidClientSummary(kind, { search = '', page = 1, pageSize = 10 
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { identifier, password } = req.body;
-    const [rows] = await db.query('SELECT * FROM users WHERE username = ? OR email = ?', [identifier, identifier]);
+    const [rows] = await platConn.query('SELECT * FROM users WHERE username = ? OR email = ?', [identifier, identifier]);
     if (!rows.length) return res.status(401).json({ error: 'Invalid credentials' });
     const u = rows[0];
     const valid = await bcrypt.compare(password, u.password);
     if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-    const token = makeToken(u.id, 1);
-    res.json({ accessToken: token, refreshToken: token, ...(await okClinicSession(u)) });
+    const token = makeToken(u.id, u.clinic_id || 1);
+    res.json({ accessToken: token, refreshToken: token, ...(await okClinicSession(u, u.clinic_id)) });
   } catch (e) { res.status(500).json({ error: { message: e.message } }); }
 });
 
@@ -208,41 +264,45 @@ app.post('/api/clinics', async (req, res) => {
     const email = owner.email || 'owner@petvet.local';
     const password = owner.password || 'password123';
     const hash = await bcrypt.hash(password, 10);
-    const [r] = await db.query('INSERT INTO users (name, username, email, password, role, phone_number) VALUES (?, ?, ?, ?, "OWNER", ?)',
-      [name, username, email, hash, owner.phoneNumber || owner.phone_number || null]);
-    const token = makeToken(r.insertId, 1);
+    const [reg] = await platConn.query('INSERT INTO clinics (clinic_name, slug) VALUES (?, ?)', [clinicName, 'petvet']);
+    const clinicId = reg.insertId;
+    await createClinicDatabase(clinicId, clinicName);
+    const [r] = await platConn.query('INSERT INTO users (name, username, email, password, role, phone_number, clinic_id) VALUES (?, ?, ?, ?, "OWNER", ?, ?)',
+      [name, username, email, hash, owner.phoneNumber || owner.phone_number || null, clinicId]);
+    const token = makeToken(r.insertId, clinicId);
     res.json({
       accessToken: token, refreshToken: token,
       user: { id: r.insertId, name, username, email, isPlatformAdmin: false },
-      activeClinic: { clinicId: 1, clinicName, slug: 'petvet', role: 'OWNER', branchId: null, accessBlocked: null },
+      activeClinic: { clinicId, clinicName, slug: 'petvet', role: 'OWNER', branchId: null, accessBlocked: null },
     });
   } catch (e) { res.status(500).json({ error: { message: e.message } }); }
 });
 
 app.get('/api/auth/me', authMiddleware, async (req, res) => {
   try {
-    const [rows] = await db.query('SELECT * FROM users WHERE id = ?', [req.userId]);
+    const [rows] = await platConn.query('SELECT * FROM users WHERE id = ?', [req.userId]);
     if (!rows.length) return res.status(404).json({ error: { message: 'Not found', code: 'NOT_FOUND' } });
-    res.json(await okClinicSession(rows[0]));
+    res.json(await okClinicSession(rows[0], req.clinicId));
   } catch (e) { res.status(500).json({ error: { message: e.message } }); }
 });
 
 app.patch('/api/auth/me', authMiddleware, async (req, res) => {
   try {
     const { name, username } = req.body;
-    await db.query('UPDATE users SET name=?, username=? WHERE id=?', [name, username, req.userId]);
-    const [rows] = await db.query('SELECT * FROM users WHERE id=?', [req.userId]);
-    res.json(await okClinicSession(rows[0]));
+    await platConn.query('UPDATE users SET name=?, username=? WHERE id=?', [name, username, req.userId]);
+    const [rows] = await platConn.query('SELECT * FROM users WHERE id=?', [req.userId]);
+    res.json(await okClinicSession(rows[0], req.clinicId));
   } catch (e) { res.status(500).json({ error: { message: e.message } }); }
 });
 
 app.post('/api/auth/switch-clinic', authMiddleware, async (req, res) => {
   let clinicName = 'PetVet Clinic';
   try {
-    const [rows] = await db.query('SELECT clinic_name FROM clinic_settings WHERE id=1');
+    const conn = await getClinicConn(req.clinicId);
+    const [rows] = await conn.query('SELECT clinic_name FROM clinic_settings WHERE id=1');
     if (rows.length && rows[0].clinic_name) clinicName = rows[0].clinic_name;
   } catch (_) {}
-  res.json({ accessToken: makeToken(req.userId, 1), refreshToken: makeToken(req.userId, 1), user: { id: req.userId, name: 'User' }, activeClinic: { clinicId: 1, clinicName, slug: 'petvet', role: 'OWNER', branchId: null } });
+  res.json({ accessToken: makeToken(req.userId, req.clinicId), refreshToken: makeToken(req.userId, req.clinicId), user: { id: req.userId, name: 'User' }, activeClinic: { clinicId: req.clinicId, clinicName, slug: 'petvet', role: 'OWNER', branchId: null } });
 });
 
 app.post('/api/auth/logout', (req, res) => res.json({ success: true }));
@@ -251,9 +311,9 @@ app.post('/api/auth/reset-password', (req, res) => res.json({ success: true }));
 app.post('/api/auth/change-password', authMiddleware, async (req, res) => {
   try {
     const { currentPassword, newPassword } = req.body;
-    const [rows] = await db.query('SELECT password FROM users WHERE id=?', [req.userId]);
+    const [rows] = await platConn.query('SELECT password FROM users WHERE id=?', [req.userId]);
     if (rows.length && await bcrypt.compare(currentPassword, rows[0].password)) {
-      await db.query('UPDATE users SET password=? WHERE id=?', [await bcrypt.hash(newPassword, 10), req.userId]);
+      await platConn.query('UPDATE users SET password=? WHERE id=?', [await bcrypt.hash(newPassword, 10), req.userId]);
     }
     res.json({ success: true });
   } catch { res.json({ success: true }); }
@@ -265,9 +325,9 @@ app.post('/api/auth/refresh', async (req, res) => {
     const parts = refreshToken.split('.');
     const p = JSON.parse(Buffer.from(parts[1], 'base64url').toString());
     const token = makeToken(p.sub, p.clinicId || 1);
-    const [rows] = await db.query('SELECT * FROM users WHERE id=?', [p.sub]);
+    const [rows] = await platConn.query('SELECT * FROM users WHERE id=?', [p.sub]);
     if (!rows.length) return res.status(401).json({ error: 'Invalid' });
-    res.json({ accessToken: token, refreshToken: token, ...(await okClinicSession(rows[0])) });
+    res.json({ accessToken: token, refreshToken: token, ...(await okClinicSession(rows[0], p.clinicId)) });
   } catch { res.status(401).json({ error: 'Invalid refresh token' }); }
 });
 
@@ -279,7 +339,7 @@ function clinicDTO(row) {
   const s = toCamel(row || {});
   return {
     id: 1, clinicName: s.clinicName || 'PetVet Clinic', slug: 'petvet',
-    logoUrl: s.logoUrl || null, brandColor: s.brandColor || '#10b981',
+    logoUrl: s.logoUrl || null, brandColor: s.brandColor || '#93caed',
     firstTimeFee: 1050, discountRange: 50, discountMinPercent: 1, discountMaxPercent: 7,
     use12HourTime: false, address: s.address || '', phone: s.phone || '',
     groupProductsOnInvoice: !!s.groupProductsOnInvoice, bankName: s.bankName || '',
@@ -314,12 +374,29 @@ app.patch('/api/clinics/me', authMiddleware, async (req, res) => {
 });
 app.get('/api/clinics/me/branding', authMiddleware, async (req, res) => {
   try { const [rows] = await settingsRow(); const s = toCamel(rows[0] || {});
-    res.json({ clinicName: s.clinicName || 'PetVet Clinic', logoUrl: s.logoUrl || null, brandColor: s.brandColor || '#10b981' });
-  } catch { res.json({ clinicName: 'PetVet Clinic', logoUrl: null, brandColor: '#10b981' }); }
+    res.json({ clinicName: s.clinicName || 'PetVet Clinic', logoUrl: s.logoUrl || null, brandColor: s.brandColor || '#93caed' });
+  } catch { res.json({ clinicName: 'PetVet Clinic', logoUrl: null, brandColor: '#93caed' }); }
 });
 
 // ─── PLANS / SUBSCRIPTION ────────────────────────────────────────────────────
-app.get('/api/plans', authMiddleware, (req, res) => res.json([{ id: 1, name: 'Basic', price: 0 }, { id: 2, name: 'Pro', price: 2999 }]));
+// NOTE: the frontend's PlanSelectScreen reads result.data.plan (array) and each
+// plan needs priceMonthly / trialDays / features to render. Server returns
+// { data: [...] } so subscriptionHandlers' `result.data` is the plans array.
+app.get('/api/plans', authMiddleware, (req, res) => res.json({ data: [
+  {
+    id: 1,
+    name: 'Free',
+    priceMonthly: 0,
+    priceYearly: 0,
+    trialDays: 30,
+    features: [
+      'Unlimited clients and pets',
+      'Appointments & billing',
+      'Products & inventory',
+      'Reports and analytics',
+    ],
+  },
+] }));
 app.post('/api/clinics/me/subscription', authMiddleware, (req, res) => res.json({ success: true }));
 
 // ─── BRANCHES ────────────────────────────────────────────────────────────────
@@ -386,10 +463,10 @@ app.get('/api/users', authMiddleware, async (req, res) => {
   try {
     const { page = 1, pageSize = 20, search = '' } = req.query;
     const sz = P(pageSize), offset = (P(page) - 1) * sz;
-    let where = '', params = [];
-    if (search) { where = 'WHERE name LIKE ? OR email LIKE ?'; params = [`%${search}%`, `%${search}%`]; }
-    const [count] = await db.query(`SELECT COUNT(*) as cnt FROM users ${where}`, params);
-    const [rows] = await db.query(`SELECT id,name,username,email,role FROM users ${where} ORDER BY name LIMIT ? OFFSET ?`, [...params, sz, offset]);
+    let where = 'WHERE clinic_id=?', params = [req.clinicId];
+    if (search) { where += ' AND (name LIKE ? OR email LIKE ?)'; params.push(`%${search}%`, `%${search}%`); }
+    const [count] = await platConn.query(`SELECT COUNT(*) as cnt FROM users ${where}`, params);
+    const [rows] = await platConn.query(`SELECT id,name,username,email,role FROM users ${where} ORDER BY name LIMIT ? OFFSET ?`, [...params, sz, offset]);
     res.json(paginate(rows, count[0].cnt, page, sz));
   } catch { res.json(EMPTY); }
 });
@@ -397,17 +474,17 @@ app.post('/api/users', authMiddleware, async (req, res) => {
   try {
     const { name, username, email, password, role } = req.body;
     const hash = await bcrypt.hash(password || 'password123', 10);
-    const [r] = await db.query('INSERT INTO users (name,username,email,password,role) VALUES (?,?,?,?,?)',
-      [name, username||email, email, hash, role||'USER']);
+    const [r] = await platConn.query('INSERT INTO users (name,username,email,password,role,clinic_id) VALUES (?,?,?,?,?,?)',
+      [name, username||email, email, hash, role||'USER', req.clinicId]);
     res.json({ data: { id: r.insertId, name } });
   } catch (e) { res.status(500).json({ error: { message: e.message } }); }
 });
 app.patch('/api/users/:id', authMiddleware, async (req, res) => {
-  try { const { name, email, role } = req.body; await db.query('UPDATE users SET name=?,email=?,role=? WHERE id=?', [name, email, role||'USER', req.params.id]); res.json({ success: true }); }
+  try { const { name, email, role } = req.body; await platConn.query("UPDATE users SET name=?,email=?,role=? WHERE id=? AND clinic_id=?", [name, email, role||'USER', req.params.id, req.clinicId]); res.json({ success: true }); }
   catch { res.json({ success: true }); }
 });
 app.delete('/api/users/:id', authMiddleware, async (req, res) => {
-  try { await db.query('DELETE FROM users WHERE id=?', [req.params.id]); res.json({ success: true }); }
+  try { await platConn.query('DELETE FROM users WHERE id=? AND clinic_id=?', [req.params.id, req.clinicId]); res.json({ success: true }); }
   catch { res.json({ success: true }); }
 });
 

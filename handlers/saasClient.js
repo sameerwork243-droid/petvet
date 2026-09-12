@@ -371,7 +371,7 @@ module.exports = {
   updateForm: (formId, payload) => apiFetch(`/api/forms/${formId}`, { method: 'PATCH', auth: true, body: payload }),
   deleteForm: (formId) => apiFetch(`/api/forms/${formId}`, { method: 'DELETE', auth: true }),
 
-  listPlans: () => apiFetch('/api/plans'),
+  listPlans: () => apiFetch('/api/plans', { auth: true }),
   selectPlan: (planId) =>
     apiFetch('/api/clinics/me/subscription', { method: 'POST', auth: true, body: { planId } }),
   getMyClinic: () => apiFetch('/api/clinics/me', { auth: true }),
