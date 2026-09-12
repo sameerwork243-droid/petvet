@@ -24,6 +24,20 @@ if (!uploadsDir) {
 uploadsDir = path.resolve(uploadsDir);
 app.use('/uploaded', express.static(uploadsDir));
 
+// If MySQL isn't reachable yet (startup retry, or env vars missing), return a
+// readable 503 instead of crashing the process with `null.query`.
+app.use((req, res, next) => {
+  if (req.path.startsWith('/api/') && !platConn) {
+    return res.status(503).json({
+      error: {
+        message: 'Database is not connected yet. Check DB_HOST/DB_USER/DB_PASSWORD and the MySQL server.',
+        code: 'DB_NOT_READY',
+      },
+    });
+  }
+  next();
+});
+
 // DEBUG: log any request that results in a 5xx so the exact failing
 // params/body can be inspected in the electron log.
 app.use((req, res, next) => {
