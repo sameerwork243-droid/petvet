@@ -271,10 +271,11 @@ const webPreload = generateWebPreload();
 
 const themePickerSource = fs.readFileSync(path.join(__dirname, 'theme-picker.js'), 'utf8');
 const colorPickerSource = fs.readFileSync(path.join(__dirname, 'color-picker.js'), 'utf8');
+const mobileUxSource = fs.readFileSync(path.join(__dirname, 'mobile-ux.js'), 'utf8');
 
 function buildWebIndexHtml() {
   const raw = fs.readFileSync(path.join(DIST_DIR, 'index.html'), 'utf8');
-  const inject = '<script src="/web-preload.js"></script>\n    <script src="/color-picker.js" defer></script>\n    <script src="/theme-picker.js" defer></script>\n  ';
+  const inject = '<script src="/web-preload.js"></script>\n    <script src="/color-picker.js" defer></script>\n    <script src="/theme-picker.js" defer></script>\n    <script src="/mobile-ux.js" defer></script>\n  ';
   return raw.replace('<head>', '<head>\n    ' + inject);
 }
 const webIndexHtml = buildWebIndexHtml();
@@ -287,6 +288,9 @@ app.get('/color-picker.js', (req, res) => {
 });
 app.get('/theme-picker.js', (req, res) => {
   res.type('application/javascript').send(themePickerSource);
+});
+app.get('/mobile-ux.js', (req, res) => {
+  res.type('application/javascript').send(mobileUxSource);
 });
 app.get('/color-picker.html', (req, res) => {
   res.type('text/html').send(fs.readFileSync(path.join(__dirname, 'color-picker.html'), 'utf8'));
