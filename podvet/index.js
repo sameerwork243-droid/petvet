@@ -75,12 +75,14 @@ class JsonStore {
 }
 const store = new JsonStore(path.join(WEB_USER_DATA_DIR, 'web-store.json'));
 
-// Rewrite desktop-persisted http://localhost:4000/... URLs so the web app is
-// self-contained and shows the same images even when the desktop is closed.
+// Rewrite desktop-persisted http://localhost:<port>/... URLs (clinic logo,
+// uploaded docs, forms) so the web app is self-contained: they become
+// origin-relative paths served by THIS server, regardless of which port the
+// desktop originally used (4000 in the API era, 8080 in the web-server era).
 {
-  const local4000 = /http:\/\/localhost:4000\/|http:\/\/127\.0\.0\.1:4000\//g;
+  const localPort = /^https?:\/\/localhost:\d+\//i;
   function rewriteValue(value) {
-    if (typeof value === 'string') return value.replace(local4000, `http://localhost:${WEB_PORT}/`);
+    if (typeof value === 'string') return value.replace(localPort, '/');
     if (Array.isArray(value)) {
       if (value.length > 2000 && value.every((v) => typeof v === 'number')) return value;
       for (let i = 0; i < value.length; i++) value[i] = rewriteValue(value[i]);
