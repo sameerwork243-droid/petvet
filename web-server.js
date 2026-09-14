@@ -336,8 +336,10 @@ app.post('/_rpc/:channel', async (req, res) => {
 // that Blob into garbage, so instead we base64-encode it with a marker the
 // generated preload decodes back into a real Uint8Array.
 const BUFFER_MARKER = '__pdfBuffer';
+const DATE_MARKER = '__date';
 function serializeRpcResult(value) {
   if (Buffer.isBuffer(value)) return { [BUFFER_MARKER]: value.toString('base64') };
+  if (value instanceof Date) return { [DATE_MARKER]: value.toISOString() };
   if (Array.isArray(value)) return value.map(serializeRpcResult);
   if (value && typeof value === 'object') {
     const out = {};
@@ -356,6 +358,9 @@ function reviveRpcResult(value) {
         for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
         return bytes;
       } catch (_) { return value; }
+    }
+    if (typeof value[DATE_MARKER] === 'string') {
+      return new Date(value[DATE_MARKER]);
     }
     for (const k of Object.keys(value)) value[k] = reviveRpcResult(value[k]);
   }
@@ -446,6 +451,9 @@ function generateWebPreload() {
           for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
           return bytes;
         } catch (_) { return value; }
+      }
+      if (typeof value.__date === 'string') {
+        return new Date(value.__date);
       }
       for (var k in value) value[k] = __revive(value[k]);
     }
