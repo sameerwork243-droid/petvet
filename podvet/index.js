@@ -171,12 +171,38 @@ app.post('/_rpc/:channel', async (req, res) => {
   if (req.body && req.body.dialogFilePath) {
     setDialogFilePath(req.body.dialogFilePath);
   }
+  // Browser-persisted session: Render wipes ~/.podvet on every restart/redeploy,
+  // so the store may be empty while the browser is still logged in. Re-inject
+  // the tokens from localStorage before the handler runs so authed RPCs work.
+  if (req.body && req.body.session && req.body.session.tokens) {
+    const { accessToken, refreshToken, user } = req.body.session;
+    if (accessToken) {
+      store.set('saasTokens', { accessToken, refreshToken, encrypted: false });
+    }
+    if (user) store.set('user', user);
+  }
   let args = (req.body && req.body.args) || [];
   try {
     const result = await handler({}, ...args);
     res.json({ ok: true, result: result === undefined ? null : serializeRpcResult(result) });
   } catch (err) {
     res.json({ ok: false, error: { message: (err && err.message) || String(err) } });
+  }
+});
+
+// Hands the current tokens back so the browser can cache them in localStorage
+// and re-inject them after a server restart wipes the on-disk store.
+rpcChannels.set('__get-tokens', async () => {
+  const raw = store.get('saasTokens');
+  if (!raw) return null;
+  if (!raw.encrypted) return raw;
+  try {
+    return {
+      accessToken: Buffer.from(raw.accessToken, 'base64').toString('utf8'),
+      refreshToken: Buffer.from(raw.refreshToken, 'base64').toString('utf8'),
+    };
+  } catch {
+    return null;
   }
 });
 

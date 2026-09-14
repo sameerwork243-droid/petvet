@@ -84,13 +84,48 @@ function generateWebPreload() {
       __listenerMap[channel] = [];
     }
   };
+  var __SESS_KEY = 'podvet_session';
+  function __loadSession() {
+    try { return JSON.parse(localStorage.getItem(__SESS_KEY) || 'null') || null; } catch (_) { return null; }
+  }
+  function __saveSession(user, tokens) {
+    try { localStorage.setItem(__SESS_KEY, JSON.stringify({ user: user, tokens: tokens })); } catch (_) {}
+  }
+  function __clearSession() {
+    try { localStorage.removeItem(__SESS_KEY); } catch (_) {}
+  }
+  // After login/switch-clinic/signup, capture the fresh user + tokens so the
+  // session survives server restarts (Render wipes ~/.podvet on deploy; the
+  // browser keeps the session and re-injects it on every RPC).
+  function __captureSession(channel, result) {
+    if (channel === 'logout') return __clearSession();
+    if (channel === 'login' || channel === 'switch-clinic' || channel === 'clinic-signup') {
+      if (result && result.user) {
+        fetch('/_rpc/__get-tokens', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ args: [] })
+        }).then(function (r) { return r.json(); }).then(function (j) {
+          if (j.ok && j.result && j.result.accessToken) {
+            __saveSession(result.user, { accessToken: j.result.accessToken, refreshToken: j.result.refreshToken });
+          }
+        }).catch(function () {});
+      }
+    }
+  }
   function __invokeRpc(channel, args, dialogFilePath) {
+    var body = { args: args, dialogFilePath: dialogFilePath };
+    var sess = __loadSession();
+    if (sess && sess.tokens && sess.tokens.accessToken) body.session = sess;
     return fetch('/_rpc/' + encodeURIComponent(channel), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ args: args, dialogFilePath: dialogFilePath })
+      body: JSON.stringify(body)
     }).then(function (r) { return r.json(); }).then(function (json) {
-      if (json.ok) return __revive(json.result);
+      if (json.ok) {
+        __captureSession(channel, json.result);
+        return __revive(json.result);
+      }
       var err = new Error((json.error && json.error.message) || 'Request failed');
       err.code = (json.error && json.error.code) || undefined;
       throw err;
