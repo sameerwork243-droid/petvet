@@ -576,11 +576,17 @@ function generateWebPreload() {
       var val = el.getAttribute(attr);
       if (!val || val.indexOf('file:') !== 0) continue;
       var p = val;
-      if (p.indexOf('file:///') === 0) p = p.substring(8);
+      if (p.indexOf('file:///') === 0) p = p.substring(7);
       else if (p.indexOf('file://') === 0) p = p.substring(7);
       else if (p.indexOf('file:/') === 0) p = p.substring(6);
       else p = p.substring(5);
-      p = p.split('/').join('\\\\');
+      // Convert any backslashes to forward slashes and strip the leading
+      // slash ONLY when it prefixes a drive letter (Windows). A plain
+      // leading '/' IS the path root on POSIX and must survive
+      // (file:///tmp/x.pdf -> /tmp/x.pdf), otherwise path.resolve() can't
+      // map it back under /tmp and /serve-file refuses it.
+      p = p.split('\\\\').join('/');
+      if (/^\\/[A-Za-z]:/.test(p)) p = p.substring(1);
       el.setAttribute(attr, '/serve-file?path=' + encodeURIComponent(p) + '&inline=1');
     }
   }
