@@ -113,15 +113,32 @@ function generateWebPreload() {
       }
     }
   }
+  // Render free tier sleeps after ~15 min idle; the wake-up cold boot can take
+  // up to a minute. Retry transient network failures (not RPC errors) so a
+  // normal cold start never surfaces as a generic "Failed to load..." toast.
+  var __RETRY_DELAYS = [1500, 3000, 6000, 12000, 24000];
+  function __fetchWithRetry(url, options, attempt) {
+    attempt = attempt || 0;
+    return fetch(url, options).then(function (r) {
+      return r.json();
+    }).catch(function () {
+      if (attempt >= __RETRY_DELAYS.length) {
+        throw new Error('Could not reach the server. Please try again.');
+      }
+      return new Promise(function (resolve) {
+        setTimeout(function () { resolve(__fetchWithRetry(url, options, attempt + 1)); }, __RETRY_DELAYS[attempt]);
+      });
+    });
+  }
   function __invokeRpc(channel, args, dialogFilePath) {
     var body = { args: args, dialogFilePath: dialogFilePath };
     var sess = __loadSession();
     if (sess && sess.tokens && sess.tokens.accessToken) body.session = sess;
-    return fetch('/_rpc/' + encodeURIComponent(channel), {
+    return __fetchWithRetry('/_rpc/' + encodeURIComponent(channel), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
-    }).then(function (r) { return r.json(); }).then(function (json) {
+    }).then(function (json) {
       if (json.ok) {
         __captureSession(channel, json.result);
         return __revive(json.result);
